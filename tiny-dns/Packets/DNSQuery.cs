@@ -11,16 +11,16 @@ public record DNSQuery : ISerializable
     public BinaryBuffer Serialize()
     {
         var buffer = new BinaryBuffer();
+        SerializeTo(buffer);
+        return buffer;
+    }
 
+    public void SerializeTo(BinaryBuffer buffer)
+    {
         if (EDNSOption != null)
             Header.AdditionalRRs = 1;
-        buffer.WriteRaw(Header.Serialize().Buffer.AsSpan());
-
-        buffer.WriteRaw(Question.Serialize().Buffer.AsSpan());
-
-        if (EDNSOption != null)
-            buffer.WriteRaw(EDNSOption.Serialize().Buffer.AsSpan());
-
-        return buffer;
+        Header.SerializeTo(buffer);
+        Question.SerializeTo(buffer);
+        EDNSOption?.SerializeTo(buffer);
     }
 }

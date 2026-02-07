@@ -47,10 +47,8 @@ public record EDNSOption : ISerializable, IDeserializable<EDNSOption>
         return ednsOption;
     }
 
-    public BinaryBuffer Serialize()
+    public void SerializeTo(BinaryBuffer buffer)
     {
-        var buffer = new BinaryBuffer();
-
         buffer.Write((byte)0);
 
         buffer.Write((ushort)41);
@@ -60,12 +58,12 @@ public record EDNSOption : ISerializable, IDeserializable<EDNSOption>
         uint ttl = (uint)((ExtendedRCode << 24) | (Version << 16) | Flags);
         buffer.Write(ttl);
 
-        ushort rdLength = (ushort)Options.Sum(option => 4 + option.Data.Length);
+        ushort rdLength = 0;
+        foreach (var option in Options)
+            rdLength += (ushort)(4 + option.Data.Length);
         buffer.Write(rdLength);
 
         foreach (var option in Options)
-            buffer.WriteRaw(option.Serialize().Buffer.AsSpan());
-
-        return buffer;
+            option.SerializeTo(buffer);
     }
 }

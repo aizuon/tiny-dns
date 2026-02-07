@@ -10,19 +10,21 @@ namespace TinyDNS;
 
 public static class RecursiveResolver
 {
-    private const string RootServer = "198.41.0.4";
+    private static readonly IPAddress RootServer = IPAddress.Parse("198.41.0.4");
+
+    private static readonly TimeSpan UdpTimeout = TimeSpan.FromSeconds(5);
 
     private static readonly ILogger Logger =
         Serilog.Log.ForContext(Constants.SourceContextPropertyName, nameof(RecursiveResolver));
 
     private static readonly MemoryCache Cache = new MemoryCache(new MemoryCacheOptions());
 
-    public static ValueTask<IPAddress> Resolve(string qname)
+    public static ValueTask<IPAddress> Resolve(string qname, CancellationToken ct = default)
     {
-        return ResolveRecursive(qname, RootServer);
+        return ResolveRecursive(qname.ToLowerInvariant(), RootServer, ct);
     }
 
-    private static async ValueTask<IPAddress> ResolveRecursive(string qname, string server)
+    private static async ValueTask<IPAddress> ResolveRecursive(string qname, IPAddress server, CancellationToken ct)
     {
         if (Cache.TryGetValue(qname, out IPAddress cachedIpAddress))
         {
@@ -39,9 +41,11 @@ public static class RecursiveResolver
         var req = query.Serialize();
 
         using var client = new UdpClient();
-        client.Connect(IPAddress.Parse(server), 53);
-        await client.SendAsync(req.Buffer.AsMemory());
-        var res = await client.ReceiveAsync();
+        client.Client.ReceiveTimeout = (int)UdpTimeout.TotalMilliseconds;
+        client.Connect(server, 53);
+        var segment = req.Buffer;
+        await client.SendAsync(segment.AsMemory(), ct);
+        var res = await client.ReceiveAsync(ct);
 
         var buffer = new BinaryBuffer(res.Buffer);
         var response = DNSResponse.Deserialize(buffer);
@@ -54,25 +58,28 @@ public static class RecursiveResolver
                 return ip;
             }
 
-        var glueRecords = response.Additionals
-            .Where(a => a.Type == 1 && a.ParsedRData is IPAddress)
-            .ToDictionary(a => a.Name, a => a);
-        foreach ((string nsHostname, var glueRecord) in glueRecords)
-            Cache.Set(nsHostname, glueRecord.ParsedRData as IPAddress,
-                TimeSpan.FromSeconds(glueRecord.TTL));
+        Dictionary<string, IPAddress> glueRecords = null;
+        foreach (var additional in response.Additionals)
+        {
+            if (additional.Type == 1 && additional.ParsedRData is IPAddress glueIp)
+            {
+                glueRecords ??= new Dictionary<string, IPAddress>();
+                glueRecords[additional.Name] = glueIp;
+                Cache.Set(additional.Name, glueIp, TimeSpan.FromSeconds(additional.TTL));
+            }
+        }
 
         foreach (var authority in response.Authorities)
             if (authority.Type == 2 && authority.ParsedRData is string nsHostname)
             {
-                if (glueRecords.TryGetValue(nsHostname, out var glueRecord))
+                if (glueRecords != null && glueRecords.TryGetValue(nsHostname, out var nsIp))
                 {
-                    var nsIP = glueRecord.ParsedRData as IPAddress;
-                    return await ResolveRecursive(qname, nsIP.ToString());
+                    return await ResolveRecursive(qname, nsIp, ct);
                 }
 
-                var resolvedNsIp = await ResolveRecursive(nsHostname, RootServer);
+                var resolvedNsIp = await ResolveRecursive(nsHostname, RootServer, ct);
                 if (resolvedNsIp != null)
-                    return await ResolveRecursive(qname, resolvedNsIp.ToString());
+                    return await ResolveRecursive(qname, resolvedNsIp, ct);
             }
 
         return null;

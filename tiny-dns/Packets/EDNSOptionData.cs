@@ -10,26 +10,16 @@ public record EDNSOptionData : ISerializable, IDeserializable<EDNSOptionData>
     public static EDNSOptionData Deserialize(BinaryBuffer buffer)
     {
         var optionData = new EDNSOptionData();
-
         optionData.Code = buffer.Read<ushort>();
-
         ushort dataLength = buffer.Read<ushort>();
-
-        optionData.Data = buffer.ReadRaw<byte>(dataLength);
-
+        optionData.Data = buffer.ReadBytes(dataLength);
         return optionData;
     }
 
-    public BinaryBuffer Serialize()
+    public void SerializeTo(BinaryBuffer buffer)
     {
-        var buffer = new BinaryBuffer();
-
         buffer.Write(Code);
-
         buffer.Write((ushort)Data.Length);
-
-        buffer.WriteRaw(Data.AsSpan());
-
-        return buffer;
+        buffer.WriteBytes(Data);
     }
 }

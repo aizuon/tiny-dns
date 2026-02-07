@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Serilog;
 using Serilog.Core;
 using Serilog.Events;
@@ -34,27 +35,34 @@ public sealed class ContextEnricher : ILogEventEnricher
     private const int MaxLength = 24;
     private const string EmptyContext = "NULL";
 
+    private static readonly ConcurrentDictionary<string, string> FormattedCache = new();
+
     public void Enrich(LogEvent logEvent, ILogEventPropertyFactory propertyFactory)
     {
         var (_, value) = logEvent.Properties.FirstOrDefault(x => x.Key == Constants.SourceContextPropertyName);
-        var ctx = (value != null ? value.ToString().Replace('\"', ' ') : EmptyContext).AsSpan();
+        var raw = value?.ToString().Replace("\"", "") ?? EmptyContext;
 
-        if (ctx.Length > MaxLength)
-            ctx = ctx[..MaxLength];
-
-        string newCtx = string.Empty;
-        if (ctx.Length < MaxLength)
+        var formatted = FormattedCache.GetOrAdd(raw, static key =>
         {
-            int l = (int)Math.Ceiling((double)(MaxLength - ctx.Length) / 2);
-            newCtx = new string(' ', l);
-        }
+            var ctx = key.AsSpan();
+            if (ctx.Length > MaxLength)
+                ctx = ctx[..MaxLength];
 
-        newCtx = $"{newCtx}{ctx}{newCtx}";
+            int ctxLen = ctx.Length;
+            return string.Create(MaxLength, (key, ctxLen), static (span, state) =>
+            {
+                span.Fill(' ');
+                var src = state.key.AsSpan();
+                if (src.Length > span.Length)
+                    src = src[..span.Length];
+                int padding = state.ctxLen < span.Length
+                    ? (int)Math.Ceiling((double)(span.Length - state.ctxLen) / 2)
+                    : 0;
+                src.CopyTo(span[padding..]);
+            });
+        });
 
-        if (newCtx.Length > MaxLength)
-            newCtx = newCtx[..MaxLength];
-
-        var eventType = propertyFactory.CreateProperty("SrcContext", newCtx);
+        var eventType = propertyFactory.CreateProperty("SrcContext", formatted);
         logEvent.AddPropertyIfAbsent(eventType);
     }
 }

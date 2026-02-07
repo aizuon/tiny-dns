@@ -14,42 +14,21 @@ public record DNSResponse : IDeserializable<DNSResponse>
     {
         var response = new DNSResponse();
 
-        var header = DNSHeader.Deserialize(buffer);
-        if (header == null)
-            return null;
-        response.Header = header;
+        response.Header = DNSHeader.Deserialize(buffer);
+        response.Question = DNSQuestion.Deserialize(buffer);
 
-        var question = DNSQuestion.Deserialize(buffer);
-        if (question == null)
-            return null;
-        response.Question = question;
-
+        var header = response.Header;
         response.Answers = new DNSResourceRecord[header.AnswerRRs];
         for (int i = 0; i < header.AnswerRRs; i++)
-        {
-            var answer = DNSResourceRecord.Deserialize(buffer);
-            if (answer == null)
-                return null;
-            response.Answers[i] = answer;
-        }
+            response.Answers[i] = DNSResourceRecord.Deserialize(buffer);
 
         response.Authorities = new DNSResourceRecord[header.AuthorityRRs];
         for (int i = 0; i < header.AuthorityRRs; i++)
-        {
-            var authority = DNSResourceRecord.Deserialize(buffer);
-            if (authority == null)
-                return null;
-            response.Authorities[i] = authority;
-        }
+            response.Authorities[i] = DNSResourceRecord.Deserialize(buffer);
 
         response.Additionals = new DNSResourceRecord[header.AdditionalRRs];
         for (int i = 0; i < header.AdditionalRRs; i++)
-        {
-            var additional = DNSResourceRecord.Deserialize(buffer);
-            if (additional == null)
-                return null;
-            response.Additionals[i] = additional;
-        }
+            response.Additionals[i] = DNSResourceRecord.Deserialize(buffer);
 
         return response;
     }

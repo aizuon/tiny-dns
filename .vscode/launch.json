@@ -1,0 +1,16 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Sandbox",
+            "type": "coreclr",
+            "request": "launch",
+            "preLaunchTask": "build (Debug)",
+            "program": "${workspaceFolder}/tiny-sandbox/bin/Debug/net10.0/tiny-sandbox.dll",
+            "args": [],
+            "cwd": "${workspaceFolder}/tiny-sandbox",
+            "console": "internalConsole",
+            "stopAtEntry": false
+        }
+    ]
+}

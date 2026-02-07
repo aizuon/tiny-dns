@@ -11,24 +11,16 @@ public record DNSQuestion : ISerializable, IDeserializable<DNSQuestion>
     public static DNSQuestion Deserialize(BinaryBuffer buffer)
     {
         var question = new DNSQuestion();
-
         question.QName = buffer.ReadDomainName();
-
         question.QType = buffer.Read<ushort>();
-
         question.QClass = buffer.Read<ushort>();
-
         return question;
     }
 
-    public BinaryBuffer Serialize()
+    public void SerializeTo(BinaryBuffer buffer)
     {
-        var buffer = new BinaryBuffer();
-
         buffer.WriteDomainName(QName);
         buffer.Write(QType);
         buffer.Write(QClass);
-
-        return buffer;
     }
 }

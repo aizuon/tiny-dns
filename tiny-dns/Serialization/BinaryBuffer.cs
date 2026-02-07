@@ -2,13 +2,12 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
-using ArgumentOutOfRangeException = System.ArgumentOutOfRangeException;
 
 namespace TinyDNS.Serialization;
 
 public class BinaryBuffer
 {
-    private readonly object _mutex = new object();
+    private const int DefaultCapacity = 64;
 
     private byte[] _buffer;
 
@@ -16,10 +15,12 @@ public class BinaryBuffer
 
     private uint _writeOffset;
 
+    private uint _capacity;
+
     public BinaryBuffer()
     {
-        _buffer = Array.Empty<byte>();
-        Capacity = 0;
+        _buffer = new byte[DefaultCapacity];
+        _capacity = DefaultCapacity;
         Length = 0;
     }
 
@@ -27,237 +28,172 @@ public class BinaryBuffer
     {
         _buffer = obj;
         _writeOffset = (uint)obj.Length;
-        Capacity = (uint)obj.Length;
+        _capacity = (uint)obj.Length;
         Length = (uint)obj.Length;
     }
 
-    public ArraySegment<byte> Buffer
-    {
-        get
-        {
-            lock (_mutex)
-            {
-                return new ArraySegment<byte>(_buffer, 0, (int)Length);
-            }
-        }
-    }
+    public ArraySegment<byte> Buffer => new ArraySegment<byte>(_buffer, 0, (int)Length);
 
     public uint Length { get; private set; }
 
-    public uint Capacity { get; private set; }
-
     public uint ReadOffset
     {
-        get
-        {
-            lock (_mutex)
-            {
-                return _readOffset;
-            }
-        }
+        get => _readOffset;
         set
         {
-            lock (_mutex)
-            {
-                if (value > Length)
-                    throw new ArgumentOutOfRangeException();
-                _readOffset = value;
-            }
+            if (value > Length)
+                throw new ArgumentOutOfRangeException();
+            _readOffset = value;
         }
     }
 
-    public uint WriteOffset
-    {
-        get
-        {
-            lock (_mutex)
-            {
-                return _writeOffset;
-            }
-        }
-        set
-        {
-            lock (_mutex)
-            {
-                if (value > Length)
-                    throw new ArgumentOutOfRangeException();
-                _writeOffset = value;
-            }
-        }
-    }
-
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Write<T>(T obj) where T : unmanaged, IBinaryNumber<T>
     {
-        lock (_mutex)
-        {
-            uint length = (uint)Unsafe.SizeOf<T>();
-            GrowIfNeeded(length);
+        uint length = (uint)Unsafe.SizeOf<T>();
+        GrowIfNeeded(length);
 
-            var bufferSpan = _buffer.AsSpan((int)_writeOffset, (int)length);
-            obj = Mem.ToBigEndian(obj);
-            MemoryMarshal.Write(bufferSpan, in obj);
+        var bufferSpan = _buffer.AsSpan((int)_writeOffset, (int)length);
+        obj = Mem.ToBigEndian(obj);
+        MemoryMarshal.Write(bufferSpan, in obj);
 
-            _writeOffset += length;
-            Length = Math.Max(Length, _writeOffset);
-        }
+        _writeOffset += length;
+        Length = Math.Max(Length, _writeOffset);
     }
 
-    public void WriteRaw<T>(Span<T> obj) where T : unmanaged, IBinaryNumber<T>
+    public void WriteBytes(ReadOnlySpan<byte> obj)
     {
-        lock (_mutex)
-        {
-            uint sizeOfT = (uint)Unsafe.SizeOf<T>();
-            uint length = (uint)obj.Length * sizeOfT;
-            GrowIfNeeded(length);
+        uint length = (uint)obj.Length;
+        GrowIfNeeded(length);
 
-            var targetSpan = new Span<byte>(_buffer, (int)_writeOffset, (int)length);
+        obj.CopyTo(_buffer.AsSpan((int)_writeOffset, (int)length));
 
-            for (int i = 0; i < obj.Length; i++)
-            {
-                var value = Mem.ToBigEndian(obj[i]);
-                MemoryMarshal.Write(targetSpan.Slice(i * (int)sizeOfT, (int)sizeOfT), in value);
-            }
-
-            _writeOffset += length;
-            Length = Math.Max(Length, _writeOffset);
-        }
-    }
-
-    public void WriteString(string obj)
-    {
-        lock (_mutex)
-        {
-            int byteCount = Encoding.ASCII.GetByteCount(obj);
-            Write((byte)byteCount);
-
-            GrowIfNeeded((uint)byteCount);
-
-            Encoding.ASCII.GetBytes(obj, 0, obj.Length, _buffer, (int)_writeOffset);
-            _writeOffset += (uint)byteCount;
-            Length = Math.Max(Length, _writeOffset);
-        }
+        _writeOffset += length;
+        Length = Math.Max(Length, _writeOffset);
     }
 
     public void WriteDomainName(string obj)
     {
-        lock (_mutex)
+        var span = obj.AsSpan();
+        int start = 0;
+        for (int i = 0; i <= span.Length; i++)
         {
-            string[] labels = obj.Split('.');
-            foreach (string label in labels)
-                WriteString(label);
-            Write((byte)0);
+            if (i == span.Length || span[i] == '.')
+            {
+                int labelLen = i - start;
+                Write((byte)labelLen);
+                GrowIfNeeded((uint)labelLen);
+                Encoding.ASCII.GetBytes(span[start..i], _buffer.AsSpan((int)_writeOffset, labelLen));
+                _writeOffset += (uint)labelLen;
+                Length = Math.Max(Length, _writeOffset);
+                start = i + 1;
+            }
         }
+
+        Write((byte)0);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T Read<T>() where T : unmanaged, IBinaryNumber<T>
     {
-        lock (_mutex)
-        {
-            uint length = (uint)Unsafe.SizeOf<T>();
+        uint length = (uint)Unsafe.SizeOf<T>();
 
-            if (_buffer.Length < _readOffset + length)
-                throw new ArgumentOutOfRangeException();
+        if (_buffer.Length < _readOffset + length)
+            throw new ArgumentOutOfRangeException();
 
-            var bufferSpan = _buffer.AsSpan((int)_readOffset, (int)length);
-            var value = MemoryMarshal.Read<T>(bufferSpan);
-            value = Mem.ToBigEndian(value);
+        var bufferSpan = _buffer.AsSpan((int)_readOffset, (int)length);
+        var value = MemoryMarshal.Read<T>(bufferSpan);
+        value = Mem.ToBigEndian(value);
 
-            _readOffset += length;
+        _readOffset += length;
 
-            return value;
-        }
+        return value;
     }
 
-    public T[] ReadRaw<T>(uint count) where T : unmanaged, IBinaryNumber<T>
+    public byte[] ReadBytes(uint count)
     {
-        lock (_mutex)
-        {
-            uint sizeOfT = (uint)Unsafe.SizeOf<T>();
-            uint length = count * sizeOfT;
+        if (_buffer.Length - _readOffset < count)
+            throw new ArgumentOutOfRangeException();
 
-            if (_buffer.Length - _readOffset < length)
-                throw new ArgumentOutOfRangeException();
+        var result = new byte[count];
+        _buffer.AsSpan((int)_readOffset, (int)count).CopyTo(result);
+        _readOffset += count;
 
-            var result = new T[count];
-            var byteSpan = new Span<byte>(_buffer, (int)_readOffset, (int)length);
-
-            var resultSpan = MemoryMarshal.Cast<byte, T>(byteSpan);
-
-            for (int i = 0; i < count; i++)
-                result[i] = Mem.ToBigEndian(resultSpan[i]);
-
-            _readOffset += length;
-
-            return result;
-        }
+        return result;
     }
 
-    public string ReadString()
+    public ReadOnlySpan<byte> ReadBytesSpan(uint count)
     {
-        lock (_mutex)
-        {
-            byte size = Read<byte>();
+        if (_buffer.Length - _readOffset < count)
+            throw new ArgumentOutOfRangeException();
 
-            if (_buffer.Length < _readOffset + size)
-                throw new ArgumentOutOfRangeException();
+        var span = _buffer.AsSpan((int)_readOffset, (int)count);
+        _readOffset += count;
 
-            string obj = Encoding.ASCII.GetString(_buffer, (int)_readOffset, size);
-            _readOffset += size;
-
-            return obj;
-        }
+        return span;
     }
 
     public string ReadDomainName()
     {
-        lock (_mutex)
+        var sb = new StringBuilder(64);
+        ReadDomainNameInto(sb);
+        return sb.ToString();
+    }
+
+    private void ReadDomainNameInto(StringBuilder sb)
+    {
+        bool first = true;
+        Span<char> chars = stackalloc char[63];
+
+        while (true)
         {
-            var labels = new List<string>();
-            bool endOfLabels = false;
+            byte lengthOrPointer = Read<byte>();
 
-            while (!endOfLabels)
+            if (lengthOrPointer == 0)
             {
-                byte lengthOrPointer = Read<byte>();
-
-                if (lengthOrPointer == 0)
-                {
-                    endOfLabels = true;
-                }
-                else if ((lengthOrPointer & 0xC0) == 0xC0)
-                {
-                    byte secondByte = Read<byte>();
-
-                    uint offset = (uint)(((lengthOrPointer & 0x3F) << 8) | secondByte);
-                    uint currentPosition = _readOffset;
-                    _readOffset = offset;
-                    string label = ReadDomainName();
-                    labels.Add(label);
-                    _readOffset = currentPosition;
-                    endOfLabels = true;
-                }
-                else
-                {
-                    _readOffset--;
-                    string label = ReadString();
-                    labels.Add(label);
-                }
+                break;
             }
+            else if ((lengthOrPointer & 0xC0) == 0xC0)
+            {
+                byte secondByte = Read<byte>();
+                uint offset = (uint)(((lengthOrPointer & 0x3F) << 8) | secondByte);
+                uint currentPosition = _readOffset;
+                _readOffset = offset;
 
-            string obj = string.Join('.', labels);
+                if (!first)
+                    sb.Append('.');
+                ReadDomainNameInto(sb);
 
-            return obj;
+                _readOffset = currentPosition;
+                return;
+            }
+            else
+            {
+                if (!first)
+                    sb.Append('.');
+                first = false;
+
+                if (_buffer.Length < _readOffset + lengthOrPointer)
+                    throw new ArgumentOutOfRangeException();
+
+                var labelChars = chars[..lengthOrPointer];
+                Encoding.ASCII.GetChars(_buffer.AsSpan((int)_readOffset, lengthOrPointer), labelChars);
+                sb.Append(labelChars);
+                _readOffset += lengthOrPointer;
+            }
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void GrowIfNeeded(uint writeLength)
     {
         uint requiredLength = _writeOffset + writeLength;
-        if (Capacity < requiredLength)
+        if (_capacity < requiredLength)
         {
-            uint newCapacity = Math.Max(Capacity * 2, requiredLength);
+            uint newCapacity = Math.Max(_capacity * 2, requiredLength);
             Array.Resize(ref _buffer, (int)newCapacity);
             Length = requiredLength;
-            Capacity = newCapacity;
+            _capacity = newCapacity;
         }
     }
 }

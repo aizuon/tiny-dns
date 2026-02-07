@@ -14,24 +14,27 @@ public record DNSResourceRecord : IDeserializable<DNSResourceRecord>
 
     public static DNSResourceRecord Deserialize(BinaryBuffer buffer)
     {
-        var authority = new DNSResourceRecord();
+        var record = new DNSResourceRecord();
 
-        authority.Name = buffer.ReadDomainName();
-        ;
-        authority.Type = buffer.Read<ushort>();
-
-        authority.Class = buffer.Read<ushort>();
-
-        authority.TTL = buffer.Read<uint>();
+        record.Name = buffer.ReadDomainName();
+        record.Type = buffer.Read<ushort>();
+        record.Class = buffer.Read<ushort>();
+        record.TTL = buffer.Read<uint>();
 
         ushort rdLength = buffer.Read<ushort>();
-        authority.RData = buffer.ReadRaw<byte>(rdLength);
-        buffer.ReadOffset -= rdLength;
-        authority.ParseRData(buffer);
-        if (authority.ParsedRData == null)
-            buffer.ReadOffset += rdLength;
+        uint rdStart = buffer.ReadOffset;
+        record.ParseRData(buffer);
+        if (record.ParsedRData == null)
+        {
+            buffer.ReadOffset = rdStart;
+            record.RData = buffer.ReadBytes(rdLength);
+        }
+        else
+        {
+            buffer.ReadOffset = rdStart + rdLength;
+        }
 
-        return authority;
+        return record;
     }
 
     private void ParseRData(BinaryBuffer buffer)
@@ -49,15 +52,12 @@ public record DNSResourceRecord : IDeserializable<DNSResourceRecord>
 
     private static IPAddress ParseARecord(BinaryBuffer buffer)
     {
-        byte[] octets = buffer.ReadRaw<byte>(4);
-
+        var octets = buffer.ReadBytesSpan(4);
         return new IPAddress(octets);
     }
 
     private static string ParseNSRecord(BinaryBuffer buffer)
     {
-        string nsDomainName = buffer.ReadDomainName();
-
-        return nsDomainName;
+        return buffer.ReadDomainName();
     }
 }

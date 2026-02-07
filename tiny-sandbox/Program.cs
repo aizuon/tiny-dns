@@ -1,4 +1,5 @@
-﻿using TinyDNS;
+﻿using System.Diagnostics;
+using TinyDNS;
 
 namespace TinySandbox;
 
@@ -8,6 +9,10 @@ internal class Program
     {
         Log.Init();
 
-        Console.WriteLine(await RecursiveResolver.Resolve("www.example.com"));
+        var sw = Stopwatch.StartNew();
+        var result = await RecursiveResolver.Resolve("www.google.com");
+        sw.Stop();
+        Console.WriteLine(result);
+        Console.WriteLine(sw.ElapsedMilliseconds);
     }
 }

@@ -4,5 +4,5 @@ namespace TinyDNS.Packets;
 
 public interface ISerializable
 {
-    public BinaryBuffer Serialize();
+    public void SerializeTo(BinaryBuffer buffer);
 }
