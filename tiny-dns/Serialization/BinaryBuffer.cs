@@ -81,6 +81,14 @@ public class BinaryBuffer
             if (i == span.Length || span[i] == '.')
             {
                 int labelLen = i - start;
+                if (labelLen > 63)
+                    throw new ArgumentException($"DNS label exceeds 63 bytes: '{obj}'");
+                if (labelLen == 0)
+                {
+                    start = i + 1;
+                    continue;
+                }
+
                 Write((byte)labelLen);
                 GrowIfNeeded((uint)labelLen);
                 Encoding.ASCII.GetBytes(span[start..i], _buffer.AsSpan((int)_writeOffset, labelLen));
@@ -136,11 +144,11 @@ public class BinaryBuffer
     public string ReadDomainName()
     {
         var sb = new StringBuilder(64);
-        ReadDomainNameInto(sb);
+        ReadDomainNameInto(sb, maxPointers: 16);
         return sb.ToString();
     }
 
-    private void ReadDomainNameInto(StringBuilder sb)
+    private void ReadDomainNameInto(StringBuilder sb, int maxPointers)
     {
         bool first = true;
         Span<char> chars = stackalloc char[63];
@@ -155,20 +163,29 @@ public class BinaryBuffer
             }
             else if ((lengthOrPointer & 0xC0) == 0xC0)
             {
+                if (maxPointers <= 0)
+                    throw new InvalidDataException("DNS compression pointer loop detected");
+
                 byte secondByte = Read<byte>();
                 uint offset = (uint)(((lengthOrPointer & 0x3F) << 8) | secondByte);
+                if (offset >= Length)
+                    throw new InvalidDataException("DNS compression pointer points beyond packet");
+
                 uint currentPosition = _readOffset;
                 _readOffset = offset;
 
                 if (!first)
                     sb.Append('.');
-                ReadDomainNameInto(sb);
+                ReadDomainNameInto(sb, maxPointers - 1);
 
                 _readOffset = currentPosition;
                 return;
             }
             else
             {
+                if (lengthOrPointer > 63)
+                    throw new InvalidDataException($"DNS label length {lengthOrPointer} exceeds maximum of 63");
+
                 if (!first)
                     sb.Append('.');
                 first = false;

@@ -10,14 +10,31 @@ public record DNSResponse : IDeserializable<DNSResponse>
     public DNSResourceRecord[] Authorities { get; set; }
     public DNSResourceRecord[] Additionals { get; set; }
 
+    private const int MaxRRCount = 4096;
+
     public static DNSResponse Deserialize(BinaryBuffer buffer)
     {
         var response = new DNSResponse();
 
         response.Header = DNSHeader.Deserialize(buffer);
-        response.Question = DNSQuestion.Deserialize(buffer);
+
+        if (response.Header.Questions == 1)
+        {
+            response.Question = DNSQuestion.Deserialize(buffer);
+        }
+        else
+        {
+            for (int i = 0; i < response.Header.Questions; i++)
+                DNSQuestion.Deserialize(buffer);
+            response.Question = new DNSQuestion();
+        }
 
         var header = response.Header;
+
+        if (header.AnswerRRs > MaxRRCount || header.AuthorityRRs > MaxRRCount || header.AdditionalRRs > MaxRRCount)
+            throw new InvalidDataException(
+                $"DNS response has excessive RR counts: {header.AnswerRRs}/{header.AuthorityRRs}/{header.AdditionalRRs}");
+
         response.Answers = new DNSResourceRecord[header.AnswerRRs];
         for (int i = 0; i < header.AnswerRRs; i++)
             response.Answers[i] = DNSResourceRecord.Deserialize(buffer);
