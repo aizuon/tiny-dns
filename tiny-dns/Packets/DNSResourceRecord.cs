@@ -1,89 +1,75 @@
 using System.Net;
+using System.Text;
 using TinyDNS.Serialization;
 
 namespace TinyDNS.Packets;
 
 public record DNSResourceRecord : IDeserializable<DNSResourceRecord>
 {
-    public string Name { get; set; }
+    public string Name { get; set; } = string.Empty;
     public ushort Type { get; set; }
     public ushort Class { get; set; }
     public uint TTL { get; set; }
-    public byte[] RData { get; set; }
-    public object ParsedRData { get; set; }
+    public byte[]? RData { get; set; }
+    public object? ParsedRData { get; set; }
 
     public static DNSResourceRecord Deserialize(BinaryBuffer buffer)
     {
-        var record = new DNSResourceRecord();
+        var record = new DNSResourceRecord
+        {
+            Name = buffer.ReadDomainName(),
+            Type = buffer.Read<ushort>(),
+            Class = buffer.Read<ushort>(),
+            TTL = buffer.Read<uint>()
+        };
 
-        record.Name = buffer.ReadDomainName();
-        record.Type = buffer.Read<ushort>();
-        record.Class = buffer.Read<ushort>();
-        record.TTL = buffer.Read<uint>();
+        var rdLength = buffer.Read<ushort>();
+        if (rdLength > buffer.Remaining)
+            throw new InvalidDataException("Resource-record data exceeds the DNS packet boundary.");
 
-        ushort rdLength = buffer.Read<ushort>();
-        uint rdStart = buffer.ReadOffset;
-        record.ParseRData(buffer);
-        if (record.ParsedRData == null)
+        var rdStart = buffer.ReadOffset;
+        var rdEnd = rdStart + rdLength;
+        record.ParsedRData = record.ParseRData(buffer, rdEnd, rdLength);
+
+        if (record.ParsedRData is null)
         {
             buffer.ReadOffset = rdStart;
             record.RData = buffer.ReadBytes(rdLength);
         }
-        else
+        else if (buffer.ReadOffset != rdEnd)
         {
-            buffer.ReadOffset = rdStart + rdLength;
+            throw new InvalidDataException(
+                $"Resource record type {record.Type} did not consume its declared RDATA length.");
         }
 
         return record;
     }
 
-    private void ParseRData(BinaryBuffer buffer)
+    private object? ParseRData(BinaryBuffer buffer, uint rdEnd, ushort rdLength)
     {
-        switch (Type)
+        return (DNSRecordType)Type switch
         {
-            case 1:
-                ParsedRData = ParseARecord(buffer);
-                break;
-            case 2:
-                ParsedRData = ParseNSRecord(buffer);
-                break;
-            case 5:
-                ParsedRData = ParseCNAMERecord(buffer);
-                break;
-            case 6:
-                ParsedRData = ParseSOARecord(buffer);
-                break;
-            case 12:
-                ParsedRData = ParsePTRRecord(buffer);
-                break;
-            case 15:
-                ParsedRData = ParseMXRecord(buffer);
-                break;
-            case 16:
-                ParsedRData = ParseTXTRecord(buffer);
-                break;
+            DNSRecordType.A => ParseAddressRecord(buffer, rdLength, 4),
+            DNSRecordType.NS => buffer.ReadDomainName(),
+            DNSRecordType.CNAME => buffer.ReadDomainName(),
+            DNSRecordType.SOA => ParseSOARecord(buffer),
+            DNSRecordType.PTR => buffer.ReadDomainName(),
+            DNSRecordType.MX => ParseMXRecord(buffer),
+            DNSRecordType.TXT => ParseTXTRecord(buffer, rdEnd),
+            DNSRecordType.AAAA => ParseAddressRecord(buffer, rdLength, 16),
+            _ => null
+        };
+    }
+
+    private static IPAddress ParseAddressRecord(BinaryBuffer buffer, ushort rdLength, ushort expectedLength)
+    {
+        if (rdLength != expectedLength)
+        {
+            throw new InvalidDataException(
+                $"Address record has an invalid RDATA length of {rdLength}; expected {expectedLength}.");
         }
-    }
 
-    private static IPAddress ParseARecord(BinaryBuffer buffer)
-    {
-        var octets = buffer.ReadBytesSpan(4);
-        return new IPAddress(octets);
-    }
-
-    private static string ParseNSRecord(BinaryBuffer buffer)
-    {
-        return buffer.ReadDomainName();
-    }
-
-    private static string ParseCNAMERecord(BinaryBuffer buffer)
-    {
-        return buffer.ReadDomainName();
-    }
-
-    private static string ParsePTRRecord(BinaryBuffer buffer)
-    {
-        return buffer.ReadDomainName();
+        return new IPAddress(buffer.ReadBytesSpan(expectedLength));
     }
 
     private static SOARecord ParseSOARecord(BinaryBuffer buffer)
@@ -109,17 +95,27 @@ public record DNSResourceRecord : IDeserializable<DNSResourceRecord>
         };
     }
 
-    private static string ParseTXTRecord(BinaryBuffer buffer)
+    private static string ParseTXTRecord(BinaryBuffer buffer, uint rdEnd)
     {
-        byte length = buffer.Read<byte>();
-        return System.Text.Encoding.UTF8.GetString(buffer.ReadBytesSpan(length));
+        var result = new StringBuilder();
+
+        while (buffer.ReadOffset < rdEnd)
+        {
+            var stringLength = buffer.Read<byte>();
+            if (stringLength > rdEnd - buffer.ReadOffset)
+                throw new InvalidDataException("TXT character-string exceeds its RDATA boundary.");
+
+            result.Append(Encoding.UTF8.GetString(buffer.ReadBytesSpan(stringLength)));
+        }
+
+        return result.ToString();
     }
 }
 
 public record SOARecord
 {
-    public string MName { get; init; }
-    public string RName { get; init; }
+    public string MName { get; init; } = string.Empty;
+    public string RName { get; init; } = string.Empty;
     public uint Serial { get; init; }
     public uint Refresh { get; init; }
     public uint Retry { get; init; }
@@ -130,5 +126,5 @@ public record SOARecord
 public record MXRecord
 {
     public ushort Preference { get; init; }
-    public string Exchange { get; init; }
+    public string Exchange { get; init; } = string.Empty;
 }

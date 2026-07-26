@@ -13,13 +13,13 @@ public static class Log
             .WriteTo.Async(log =>
                 log.File(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "log/log_.log"),
                     outputTemplate:
-                    "[{Timestamp:HH:mm:ss} {Level:u3}] |{SrcContext}| {Message}{NewLine}{Exception}",
+                    "[{Timestamp:HH:mm:ss} {Level:u3}] |{SrcContext}| {Message:lj}{NewLine}{Exception}",
                     rollingInterval: RollingInterval.Day,
                     rollOnFileSizeLimit: true))
             .WriteTo.Async(console =>
                 console.Console(
                     outputTemplate:
-                    "[{Timestamp:HH:mm:ss} {Level:u3}] |{SrcContext}| {Message}{NewLine}{Exception}"))
+                    "[{Timestamp:HH:mm:ss} {Level:u3}] |{SrcContext}| {Message:lj}{NewLine}{Exception}"))
             .Enrich.With<ContextEnricher>()
 #if DEBUG
             .MinimumLevel.Verbose()
@@ -39,25 +39,22 @@ public sealed class ContextEnricher : ILogEventEnricher
 
     public void Enrich(LogEvent logEvent, ILogEventPropertyFactory propertyFactory)
     {
-        var (_, value) = logEvent.Properties.FirstOrDefault(x => x.Key == Constants.SourceContextPropertyName);
-        var raw = value?.ToString().Replace("\"", "") ?? EmptyContext;
+        var raw = logEvent.Properties.TryGetValue(Constants.SourceContextPropertyName, out var value) &&
+                  value is ScalarValue { Value: string sourceContext }
+            ? sourceContext
+            : EmptyContext;
 
         var formatted = FormattedCache.GetOrAdd(raw, static key =>
         {
-            var ctx = key.AsSpan();
-            if (ctx.Length > MaxLength)
-                ctx = ctx[..MaxLength];
-
-            int ctxLen = ctx.Length;
-            return string.Create(MaxLength, (key, ctxLen), static (span, state) =>
+            var contextLength = Math.Min(key.Length, MaxLength);
+            return string.Create(MaxLength, (key, contextLength), static (span, state) =>
             {
                 span.Fill(' ');
                 var src = state.key.AsSpan();
                 if (src.Length > span.Length)
                     src = src[..span.Length];
-                int padding = state.ctxLen < span.Length
-                    ? (int)Math.Ceiling((double)(span.Length - state.ctxLen) / 2)
-                    : 0;
+
+                var padding = (span.Length - state.contextLength + 1) / 2;
                 src.CopyTo(span[padding..]);
             });
         });

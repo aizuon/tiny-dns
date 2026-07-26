@@ -19,23 +19,23 @@ public static class Mem
             case 1:
                 return obj;
             case 2:
-            {
-                ushort val = Unsafe.As<T, ushort>(ref obj);
-                val = BinaryPrimitives.ReverseEndianness(val);
-                return Unsafe.As<ushort, T>(ref val);
-            }
+                {
+                    ushort val = Unsafe.As<T, ushort>(ref obj);
+                    val = BinaryPrimitives.ReverseEndianness(val);
+                    return Unsafe.As<ushort, T>(ref val);
+                }
             case 4:
-            {
-                uint val = Unsafe.As<T, uint>(ref obj);
-                val = BinaryPrimitives.ReverseEndianness(val);
-                return Unsafe.As<uint, T>(ref val);
-            }
+                {
+                    uint val = Unsafe.As<T, uint>(ref obj);
+                    val = BinaryPrimitives.ReverseEndianness(val);
+                    return Unsafe.As<uint, T>(ref val);
+                }
             case 8:
-            {
-                ulong val = Unsafe.As<T, ulong>(ref obj);
-                val = BinaryPrimitives.ReverseEndianness(val);
-                return Unsafe.As<ulong, T>(ref val);
-            }
+                {
+                    ulong val = Unsafe.As<T, ulong>(ref obj);
+                    val = BinaryPrimitives.ReverseEndianness(val);
+                    return Unsafe.As<ulong, T>(ref val);
+                }
             default:
                 throw new NotSupportedException($"ToBigEndian does not support size {size}");
         }

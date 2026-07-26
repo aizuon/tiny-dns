@@ -1,4 +1,5 @@
-﻿using System.Collections.Concurrent;
+﻿using System.Buffers.Binary;
+using System.Globalization;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -13,8 +14,8 @@ namespace TinyDNS;
 
 public static class RecursiveResolver
 {
-    private static readonly IPAddress[] RootServers = new[]
-    {
+    private static readonly IPAddress[] RootServers =
+    [
         IPAddress.Parse("198.41.0.4"),
         IPAddress.Parse("199.9.14.201"),
         IPAddress.Parse("192.33.4.12"),
@@ -28,7 +29,7 @@ public static class RecursiveResolver
         IPAddress.Parse("193.0.14.129"),
         IPAddress.Parse("199.7.83.42"),
         IPAddress.Parse("202.12.27.33")
-    };
+    ];
 
     private static int _rootServerIndex;
 
@@ -43,15 +44,18 @@ public static class RecursiveResolver
     public static bool UseDnsOverTls { get; set; }
     public static bool UseDnsOverHttps { get; set; }
 
-    public static string DnsOverHttpsUrl { get; set; }
+    public static string? DnsOverHttpsUrl { get; set; }
 
-    public static IPAddress ForwardingDnsServer { get; set; }
+    public static IPAddress? ForwardingDnsServer { get; set; }
+
+    public static string? DnsOverTlsHostName { get; set; }
 
     public static bool AllowInvalidCertificates { get; set; }
 
     private static readonly HttpClient HttpClient = new HttpClient
     {
-        Timeout = HttpsTimeout
+        Timeout = HttpsTimeout,
+        MaxResponseContentBufferSize = ushort.MaxValue
     };
 
     private static readonly ILogger Logger =
@@ -64,9 +68,9 @@ public static class RecursiveResolver
         maxQueriesGlobalPerSecond: 100
     );
 
-    private const uint DefaultNegativeCacheTTL = 300;
     private const int MaxCnameChainDepth = 10;
     private const int MaxRecursionDepth = 20;
+    private const int MaxParallelNameservers = 2;
 
     static RecursiveResolver()
     {
@@ -78,97 +82,182 @@ public static class RecursiveResolver
         );
     }
 
-    public static async ValueTask<IPAddress> Resolve(string qname, CancellationToken ct = default)
+    public static async ValueTask<IPAddress?> Resolve(string qname, CancellationToken ct = default)
     {
+        qname = NormalizeQueryName(qname);
         Logger.Information("Starting DNS resolution for {QName}", qname);
 
-        if (ForwardingDnsServer != null)
+        if (Cache.TryGetValue(qname, out object? cachedEntry))
         {
-            return await ResolveWithForwarding(qname.ToLowerInvariant(), ct);
+            if (cachedEntry is IPAddress cachedAddress)
+            {
+                Logger.Information("Resolved {QName} → {IP} from cache", qname, cachedAddress);
+                return cachedAddress;
+            }
+            if (cachedEntry is NegativeCacheEntry)
+                return null;
         }
 
-        return await ResolveWithRootFallback(qname.ToLowerInvariant(), ct, 0);
+        if (UseDnsOverTls && ForwardingDnsServer is null)
+        {
+            throw new InvalidOperationException(
+                "DNS-over-TLS requires ForwardingDnsServer because authoritative DNS servers do not generally expose DoT.");
+        }
+
+        var result = ForwardingDnsServer is not null
+            ? await ResolveWithForwarding(qname, ct)
+            : await ResolveWithRootFallback(qname, ct, 0);
+
+        if (result is not null)
+            Logger.Information("Completed DNS resolution: {QName} → {IP}", qname, result);
+
+        return result;
     }
 
     public static async ValueTask<DNSResourceRecord[]> Query(string qname, DNSRecordType qtype,
         CancellationToken ct = default)
     {
+        qname = NormalizeQueryName(qname);
         Logger.Information("Starting DNS query for {QName} (type={QType})", qname, qtype);
 
-        if (ForwardingDnsServer != null)
+        if (UseDnsOverTls && ForwardingDnsServer is null)
         {
-            return await QueryWithForwarding(qname.ToLowerInvariant(), (ushort)qtype, ct);
+            throw new InvalidOperationException(
+                "DNS-over-TLS requires ForwardingDnsServer because authoritative DNS servers do not generally expose DoT.");
         }
 
-        return await QueryWithRootFallback(qname.ToLowerInvariant(), (ushort)qtype, ct, 0);
+        var records = ForwardingDnsServer is not null
+            ? await QueryWithForwarding(qname, (ushort)qtype, ct)
+            : await QueryWithRootFallback(qname, (ushort)qtype, ct, 0);
+
+        Logger.Information("Completed DNS query for {QName}: {Count} answer(s)", qname, records.Length);
+        return records;
     }
 
-    public static async ValueTask<string> ReverseLookup(IPAddress ipAddress, CancellationToken ct = default)
+    public static async ValueTask<string?> ReverseLookup(IPAddress ipAddress, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(ipAddress);
+
         var reverseQuery = BuildReverseQuery(ipAddress);
         Logger.Information("Starting reverse DNS lookup for {IP} ({Query})", ipAddress, reverseQuery);
 
-        var records = await QueryWithRootFallback(reverseQuery, (ushort)DNSRecordType.PTR, ct, 0);
-        if (records.Length > 0 && records[0].ParsedRData is string hostname)
-            return hostname;
+        var records = await Query(reverseQuery, DNSRecordType.PTR, ct);
+        foreach (var record in records)
+        {
+            if (record.Type == (ushort)DNSRecordType.PTR && record.ParsedRData is string hostname)
+                return hostname;
+        }
 
         return null;
     }
 
-    private static string BuildReverseQuery(IPAddress ipAddress)
+    internal static string BuildReverseQuery(IPAddress ipAddress)
     {
+        if (ipAddress.IsIPv4MappedToIPv6)
+            ipAddress = ipAddress.MapToIPv4();
+
         var bytes = ipAddress.GetAddressBytes();
         if (bytes.Length == 4)
         {
             return $"{bytes[3]}.{bytes[2]}.{bytes[1]}.{bytes[0]}.in-addr.arpa";
         }
 
-        throw new NotSupportedException("IPv6 reverse lookups not yet supported");
+        var builder = new System.Text.StringBuilder(bytes.Length * 4 + "ip6.arpa".Length);
+        for (var i = bytes.Length - 1; i >= 0; i--)
+        {
+            builder.Append((bytes[i] & 0x0F).ToString("x", CultureInfo.InvariantCulture));
+            builder.Append('.');
+            builder.Append((bytes[i] >> 4).ToString("x", CultureInfo.InvariantCulture));
+            builder.Append('.');
+        }
+
+        return builder.Append("ip6.arpa").ToString();
     }
 
     private static IPAddress GetNextRootServer()
     {
-        var index = (Interlocked.Increment(ref _rootServerIndex) & 0x7FFFFFFF) % RootServers.Length;
+        var index = ((Interlocked.Increment(ref _rootServerIndex) - 1) & 0x7FFFFFFF) % RootServers.Length;
         return RootServers[index];
     }
 
-    private static async ValueTask<IPAddress> ResolveWithForwarding(string qname, CancellationToken ct,
+    private static async ValueTask<IPAddress?> ResolveWithForwarding(string qname, CancellationToken ct,
         int cnameDepth = 0)
     {
-        if (cnameDepth > MaxCnameChainDepth)
+        if (cnameDepth >= MaxCnameChainDepth)
         {
             Logger.Warning("CNAME chain too deep via forwarding for {QName}, aborting", qname);
             return null;
         }
 
-        var server = ForwardingDnsServer;
-        Logger.Information("Forwarding query for {QName} to {Server}", qname, server);
+        var server = ForwardingDnsServer ??
+                     throw new InvalidOperationException("A forwarding DNS server has not been configured.");
+        Logger.Debug("Forwarding query for {QName} to {Server}", qname, server);
 
-        var query = new DNSQuery
-        {
-            Header = new DNSHeader(),
-            Question = new DNSQuestion { QName = qname }
-        };
+        var query = CreateQuery(qname, (ushort)DNSRecordType.A);
 
         var response = await SendDnsQuery(query, server, ct);
+        if (!ValidateResponse(query, response, server, string.Empty))
+            return null;
+
+        if (response.Header.RCode == 3)
+        {
+            var negativeTtl = ExtractNegativeTTL(response.Authorities);
+            if (negativeTtl > 0)
+                Cache.Set(qname, NegativeCacheEntry.Instance, TimeSpan.FromSeconds(negativeTtl));
+
+            return null;
+        }
+
+        if (response.Header.RCode != 0)
+            return null;
 
         if (response.Answers.Length > 0)
         {
             foreach (var answer in response.Answers)
             {
-                if (answer.Type == 1 && answer.ParsedRData is IPAddress ip)
+                if (answer.Type == (ushort)DNSRecordType.A &&
+                    answer.Class == 1 &&
+                    string.Equals(answer.Name, qname, StringComparison.OrdinalIgnoreCase) &&
+                    answer.ParsedRData is IPAddress ip)
                 {
-                    Logger.Information("Resolved {QName} → {IP} via forwarding", qname, ip);
+                    Logger.Debug("Resolved {QName} → {IP} via forwarding", qname, ip);
+                    if (answer.TTL > 0)
+                        Cache.Set(qname, ip, TimeSpan.FromSeconds(answer.TTL));
+
                     return ip;
                 }
             }
 
             foreach (var answer in response.Answers)
             {
-                if (answer.Type == 5 && answer.ParsedRData is string cnameTarget)
+                if (answer.Type == (ushort)DNSRecordType.CNAME &&
+                    answer.Class == 1 &&
+                    string.Equals(answer.Name, qname, StringComparison.OrdinalIgnoreCase) &&
+                    answer.ParsedRData is string cnameTarget)
                 {
-                    Logger.Information("CNAME {QName} → {Target} via forwarding, following", qname, cnameTarget);
-                    return await ResolveWithForwarding(cnameTarget.ToLowerInvariant(), ct, cnameDepth + 1);
+                    var normalizedTarget = NormalizeQueryName(cnameTarget);
+                    foreach (var targetAnswer in response.Answers)
+                    {
+                        if (targetAnswer.Type != (ushort)DNSRecordType.A ||
+                            targetAnswer.Class != 1 ||
+                            !string.Equals(targetAnswer.Name, normalizedTarget, StringComparison.OrdinalIgnoreCase) ||
+                            targetAnswer.ParsedRData is not IPAddress includedTargetIp)
+                        {
+                            continue;
+                        }
+
+                        var ttl = Math.Min(answer.TTL, targetAnswer.TTL);
+                        if (ttl > 0)
+                            Cache.Set(qname, includedTargetIp, TimeSpan.FromSeconds(ttl));
+
+                        Logger.Debug("Resolved {QName} → {IP} from forwarded CNAME answers", qname,
+                            includedTargetIp);
+                        return includedTargetIp;
+                    }
+
+                    Logger.Debug("CNAME {QName} → {Target} via forwarding, following", qname, cnameTarget);
+                    var targetIp = await ResolveWithForwarding(normalizedTarget, ct, cnameDepth + 1);
+                    return targetIp;
                 }
             }
         }
@@ -180,27 +269,31 @@ public static class RecursiveResolver
     private static async ValueTask<DNSResourceRecord[]> QueryWithForwarding(string qname, ushort qtype,
         CancellationToken ct)
     {
-        var server = ForwardingDnsServer;
-        Logger.Information("Forwarding query for {QName} (type={QType}) to {Server}", qname, qtype, server);
+        var server = ForwardingDnsServer ??
+                     throw new InvalidOperationException("A forwarding DNS server has not been configured.");
+        Logger.Debug("Forwarding query for {QName} (type={QType}) to {Server}", qname, qtype, server);
 
-        var query = new DNSQuery
-        {
-            Header = new DNSHeader(),
-            Question = new DNSQuestion { QName = qname, QType = qtype }
-        };
+        var query = CreateQuery(qname, qtype);
 
         var response = await SendDnsQuery(query, server, ct);
-        Logger.Information("Received {Count} answers via forwarding for {QName}", response.Answers.Length, qname);
+        if (!ValidateResponse(query, response, server, string.Empty) || response.Header.RCode != 0)
+            return [];
+        Logger.Debug("Received {Count} answers via forwarding for {QName}", response.Answers.Length, qname);
         return response.Answers;
     }
 
-    private static async ValueTask<IPAddress> ResolveWithRootFallback(string qname, CancellationToken ct, int depth)
+    private static async ValueTask<IPAddress?> ResolveWithRootFallback(string qname, CancellationToken ct, int depth)
     {
-        return await ResolveWithRootFallback(qname, ct, depth, new ConcurrentDictionary<string, byte>());
+        return await ResolveWithRootFallback(qname, ct, depth, 0,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
     }
 
-    private static async ValueTask<IPAddress> ResolveWithRootFallback(string qname, CancellationToken ct, int depth,
-        ConcurrentDictionary<string, byte> visitedCnames)
+    private static async ValueTask<IPAddress?> ResolveWithRootFallback(
+        string qname,
+        CancellationToken ct,
+        int depth,
+        int cnameDepth,
+        HashSet<string> visitedCnames)
     {
         var attemptedServers = new HashSet<IPAddress>();
         var maxAttempts = Math.Min(3, RootServers.Length);
@@ -213,18 +306,29 @@ public static class RecursiveResolver
 
             try
             {
-                var result = await ResolveRecursive(qname, rootServer, ct, depth, visitedCnames);
+                var result = await ResolveRecursive(
+                    qname,
+                    rootServer,
+                    ct,
+                    depth,
+                    cnameDepth,
+                    new HashSet<string>(visitedCnames, StringComparer.OrdinalIgnoreCase));
                 if (result != null)
                     return result;
+
+                if (Cache.TryGetValue(qname, out object? cachedEntry) && cachedEntry is NegativeCacheEntry)
+                    return null;
             }
-            catch (Exception ex) when (ex is SocketException or TimeoutException or OperationCanceledException
-                                           or IOException or InvalidDataException)
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsTransientNetworkFailure(ex))
             {
                 Logger.Warning("Root server {Server} failed: {Error}, trying next server", rootServer, ex.Message);
             }
         }
 
-        Logger.Warning("All root server attempts failed for {QName}", qname);
+        if (depth == 0)
+            Logger.Warning("All root server attempts failed for {QName}", qname);
+        else
+            Logger.Debug("All root server attempts failed for {QName}", qname);
         return null;
     }
 
@@ -246,14 +350,16 @@ public static class RecursiveResolver
                 if (result.Length > 0)
                     return result;
             }
-            catch (Exception ex) when (ex is SocketException or TimeoutException or OperationCanceledException
-                                           or IOException or InvalidDataException)
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsTransientNetworkFailure(ex))
             {
                 Logger.Warning("Root server {Server} failed: {Error}, trying next server", rootServer, ex.Message);
             }
         }
 
-        Logger.Warning("All root server attempts failed for {QName}", qname);
+        if (depth == 0)
+            Logger.Warning("All root server attempts failed for {QName}", qname);
+        else
+            Logger.Debug("All root server attempts failed for {QName}", qname);
         return Array.Empty<DNSResourceRecord>();
     }
 
@@ -263,8 +369,11 @@ public static class RecursiveResolver
         CancellationToken ct
     )
     {
-        if (UseDnsOverHttps && !string.IsNullOrEmpty(DnsOverHttpsUrl))
+        if (UseDnsOverHttps)
         {
+            if (string.IsNullOrWhiteSpace(DnsOverHttpsUrl))
+                throw new InvalidOperationException("DnsOverHttpsUrl must be set when DNS-over-HTTPS is enabled.");
+
             return await SendDnsQueryOverHttps(query, ct);
         }
 
@@ -277,6 +386,9 @@ public static class RecursiveResolver
 
         if (response.Header.TC == 1)
         {
+            if (response.Header.QR != 1 || response.Header.Id != query.Header.Id)
+                throw new InvalidDataException("Truncated UDP response has an invalid DNS header.");
+
             Logger.Verbose("Response truncated (TC=1) from {Server}, retrying over TCP", server);
             return await SendDnsQueryOverTcp(query, server, ct);
         }
@@ -291,7 +403,7 @@ public static class RecursiveResolver
     )
     {
         var req = query.Serialize();
-        using var client = new UdpClient();
+        using var client = new UdpClient(server.AddressFamily);
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(UdpTimeout);
         client.Connect(server, 53);
@@ -299,7 +411,19 @@ public static class RecursiveResolver
         await client.SendAsync(segment.AsMemory(), cts.Token);
         var res = await client.ReceiveAsync(cts.Token);
         var buffer = new BinaryBuffer(res.Buffer);
-        return DNSResponse.Deserialize(buffer);
+        try
+        {
+            return DNSResponse.Deserialize(buffer);
+        }
+        catch (InvalidDataException)
+        {
+            buffer.ReadOffset = 0;
+            var header = DNSHeader.Deserialize(buffer);
+            if (header.TC != 1 || header.QR != 1 || header.Id != query.Header.Id)
+                throw;
+
+            return new DNSResponse { Header = header };
+        }
     }
 
     private static async ValueTask<DNSResponse> SendDnsQueryOverTcp(
@@ -308,41 +432,12 @@ public static class RecursiveResolver
         CancellationToken ct
     )
     {
-        using var tcpClient = new TcpClient();
+        using var tcpClient = new TcpClient(server.AddressFamily);
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TcpTimeout);
 
         await tcpClient.ConnectAsync(server, 53, cts.Token);
-        var stream = tcpClient.GetStream();
-
-        var req = query.Serialize();
-        var lengthPrefix = new byte[2];
-        lengthPrefix[0] = (byte)(req.Buffer.Count >> 8);
-        lengthPrefix[1] = (byte)(req.Buffer.Count & 0xFF);
-
-        await stream.WriteAsync(lengthPrefix.AsMemory(), cts.Token);
-        await stream.WriteAsync(req.Buffer.AsMemory(), cts.Token);
-        await stream.FlushAsync(cts.Token);
-
-        var lengthBuffer = new byte[2];
-        var bytesRead = await stream.ReadAsync(lengthBuffer.AsMemory(), cts.Token);
-        if (bytesRead != 2)
-            throw new IOException("Failed to read length prefix from TCP response");
-
-        var responseLength = (lengthBuffer[0] << 8) | lengthBuffer[1];
-        var responseBuffer = new byte[responseLength];
-        var totalRead = 0;
-
-        while (totalRead < responseLength)
-        {
-            bytesRead = await stream.ReadAsync(responseBuffer.AsMemory(totalRead), cts.Token);
-            if (bytesRead == 0)
-                throw new IOException("Connection closed before full TCP response received");
-            totalRead += bytesRead;
-        }
-
-        var buffer = new BinaryBuffer(responseBuffer);
-        return DNSResponse.Deserialize(buffer);
+        return await SendLengthPrefixedQuery(query, tcpClient.GetStream(), cts.Token, "TCP");
     }
 
     private static async ValueTask<DNSResponse> SendDnsQueryOverTls(
@@ -351,7 +446,7 @@ public static class RecursiveResolver
         CancellationToken ct
     )
     {
-        using var tcpClient = new TcpClient();
+        using var tcpClient = new TcpClient(server.AddressFamily);
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(TlsTimeout);
 
@@ -364,39 +459,14 @@ public static class RecursiveResolver
 
         var sslOptions = new SslClientAuthenticationOptions
         {
-            TargetHost = server.ToString(),
+            TargetHost = string.IsNullOrWhiteSpace(DnsOverTlsHostName)
+                ? server.ToString()
+                : DnsOverTlsHostName,
             RemoteCertificateValidationCallback = ValidateServerCertificate
         };
         await sslStream.AuthenticateAsClientAsync(sslOptions, cts.Token);
 
-        var req = query.Serialize();
-        var lengthPrefix = new byte[2];
-        lengthPrefix[0] = (byte)(req.Buffer.Count >> 8);
-        lengthPrefix[1] = (byte)(req.Buffer.Count & 0xFF);
-
-        await sslStream.WriteAsync(lengthPrefix.AsMemory(), cts.Token);
-        await sslStream.WriteAsync(req.Buffer.AsMemory(), cts.Token);
-        await sslStream.FlushAsync(cts.Token);
-
-        var lengthBuffer = new byte[2];
-        var bytesRead = await sslStream.ReadAsync(lengthBuffer.AsMemory(), cts.Token);
-        if (bytesRead != 2)
-            throw new IOException("Failed to read length prefix from DoT response");
-
-        var responseLength = (lengthBuffer[0] << 8) | lengthBuffer[1];
-        var responseBuffer = new byte[responseLength];
-        var totalRead = 0;
-
-        while (totalRead < responseLength)
-        {
-            bytesRead = await sslStream.ReadAsync(responseBuffer.AsMemory(totalRead), cts.Token);
-            if (bytesRead == 0)
-                throw new IOException("Connection closed before full DoT response received");
-            totalRead += bytesRead;
-        }
-
-        var buffer = new BinaryBuffer(responseBuffer);
-        return DNSResponse.Deserialize(buffer);
+        return await SendLengthPrefixedQuery(query, sslStream, cts.Token, "DoT");
     }
 
     private static async ValueTask<DNSResponse> SendDnsQueryOverHttps(
@@ -404,32 +474,92 @@ public static class RecursiveResolver
         CancellationToken ct
     )
     {
-        if (string.IsNullOrEmpty(DnsOverHttpsUrl))
+        if (string.IsNullOrWhiteSpace(DnsOverHttpsUrl))
             throw new InvalidOperationException("DnsOverHttpsUrl must be set when UseDnsOverHttps is enabled");
+        if (!Uri.TryCreate(DnsOverHttpsUrl, UriKind.Absolute, out var endpoint) ||
+            endpoint.Scheme != Uri.UriSchemeHttps)
+        {
+            throw new InvalidOperationException("DnsOverHttpsUrl must be an absolute HTTPS URL.");
+        }
 
         var req = query.Serialize();
         var content = new ByteArrayContent(req.Buffer.Array!, req.Buffer.Offset, req.Buffer.Count);
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/dns-message");
 
-        using var request = new HttpRequestMessage(HttpMethod.Post, DnsOverHttpsUrl)
+        using var request = new HttpRequestMessage(HttpMethod.Post, endpoint)
         {
             Content = content
         };
         request.Headers.Accept.Add(
             new System.Net.Http.Headers.MediaTypeWithQualityHeaderValue("application/dns-message"));
 
-        using var response = await HttpClient.SendAsync(request, ct);
+        using var response = await HttpClient.SendAsync(
+            request,
+            HttpCompletionOption.ResponseHeadersRead,
+            ct);
         response.EnsureSuccessStatusCode();
 
-        var responseBytes = await response.Content.ReadAsByteArrayAsync(ct);
+        if (response.Content.Headers.ContentLength > ushort.MaxValue)
+            throw new InvalidDataException("DNS-over-HTTPS response exceeds the DNS message size limit.");
+
+        var responseBytes = await ReadDnsOverHttpsResponse(response.Content, ct);
+
         var buffer = new BinaryBuffer(responseBytes);
         return DNSResponse.Deserialize(buffer);
     }
 
+    private static async ValueTask<byte[]> ReadDnsOverHttpsResponse(HttpContent content, CancellationToken ct)
+    {
+        await using var responseStream = await content.ReadAsStreamAsync(ct);
+        using var output = new MemoryStream(content.Headers.ContentLength is > 0 and <= ushort.MaxValue
+            ? (int)content.Headers.ContentLength.Value
+            : 512);
+        var chunk = new byte[8192];
+
+        while (true)
+        {
+            var bytesRead = await responseStream.ReadAsync(chunk, ct);
+            if (bytesRead == 0)
+                return output.ToArray();
+
+            if (output.Length + bytesRead > ushort.MaxValue)
+                throw new InvalidDataException("DNS-over-HTTPS response exceeds the DNS message size limit.");
+
+            output.Write(chunk, 0, bytesRead);
+        }
+    }
+
+    internal static async ValueTask<DNSResponse> SendLengthPrefixedQuery(
+        DNSQuery query,
+        Stream stream,
+        CancellationToken ct,
+        string transportName)
+    {
+        var request = query.Serialize();
+        if (request.Buffer.Count > ushort.MaxValue)
+            throw new InvalidOperationException("DNS query exceeds the maximum TCP message size.");
+
+        var lengthPrefix = new byte[sizeof(ushort)];
+        BinaryPrimitives.WriteUInt16BigEndian(lengthPrefix, (ushort)request.Buffer.Count);
+
+        await stream.WriteAsync(lengthPrefix, ct);
+        await stream.WriteAsync(request.Buffer.AsMemory(), ct);
+        await stream.FlushAsync(ct);
+
+        await stream.ReadExactlyAsync(lengthPrefix, ct);
+        var responseLength = BinaryPrimitives.ReadUInt16BigEndian(lengthPrefix);
+        if (responseLength == 0)
+            throw new InvalidDataException($"{transportName} returned an empty DNS message.");
+
+        var responseBytes = new byte[responseLength];
+        await stream.ReadExactlyAsync(responseBytes, ct);
+        return DNSResponse.Deserialize(new BinaryBuffer(responseBytes));
+    }
+
     private static bool ValidateServerCertificate(
         object sender,
-        X509Certificate certificate,
-        X509Chain chain,
+        X509Certificate? certificate,
+        X509Chain? chain,
         SslPolicyErrors sslPolicyErrors
     )
     {
@@ -474,8 +604,13 @@ public static class RecursiveResolver
         return false;
     }
 
-    private static async ValueTask<IPAddress> ResolveRecursive(string qname, IPAddress server, CancellationToken ct,
-        int depth, ConcurrentDictionary<string, byte> visitedCnames)
+    private static async ValueTask<IPAddress?> ResolveRecursive(
+        string qname,
+        IPAddress server,
+        CancellationToken ct,
+        int depth,
+        int cnameDepth,
+        HashSet<string> visitedCnames)
     {
         var indent = new string(' ', depth * 2);
 
@@ -485,32 +620,30 @@ public static class RecursiveResolver
             return null;
         }
 
-        if (Cache.TryGetValue(qname, out object cachedEntry))
+        if (Cache.TryGetValue(qname, out object? cachedEntry))
         {
             if (cachedEntry is NegativeCacheEntry)
             {
-                Logger.Information("{Indent}└─ Negative cache hit: {QName} (does not exist)", indent, qname);
+                Logger.Debug("{Indent}└─ Negative cache hit: {QName} (does not exist)", indent, qname);
                 return null;
             }
 
-            var cachedIpAddress = (IPAddress)cachedEntry;
-            Logger.Information("{Indent}└─ Cache hit: {QName} → {IP}", indent, qname, cachedIpAddress);
-            return cachedIpAddress;
+            if (cachedEntry is IPAddress cachedIpAddress)
+            {
+                Logger.Debug("{Indent}└─ Cache hit: {QName} → {IP}", indent, qname, cachedIpAddress);
+                return cachedIpAddress;
+            }
         }
 
-        Logger.Information("{Indent}├─ Query: {QName} @ {Server} (depth={Depth})", indent, qname, server, depth);
+        Logger.Debug("{Indent}├─ Query: {QName} @ {Server} (depth={Depth})", indent, qname, server, depth);
 
         if (!RateLimiter.AllowQuery(server.ToString()))
         {
-            Logger.Warning("{Indent}└─ Rate limit exceeded for {Server}, query rejected", indent, server);
+            Logger.Debug("{Indent}└─ Rate limit exceeded for {Server}, query rejected", indent, server);
             return null;
         }
 
-        var query = new DNSQuery
-        {
-            Header = new DNSHeader(),
-            Question = new DNSQuestion { QName = qname }
-        };
+        var query = CreateQuery(qname, (ushort)DNSRecordType.A);
 
         var response = await SendDnsQuery(query, server, ct);
 
@@ -537,12 +670,18 @@ public static class RecursiveResolver
         if (response.Header.RCode == 3)
         {
             var negativeTtl = ExtractNegativeTTL(response.Authorities);
-            Logger.Information("{Indent}└─ NXDOMAIN: {QName} does not exist (TTL={TTL}s)", indent, qname, negativeTtl);
-            if (negativeTtl > 0)
+            Logger.Debug("{Indent}└─ NXDOMAIN: {QName} does not exist (TTL={TTL}s)", indent, qname, negativeTtl);
+            if (negativeTtl > 0 && CanTrustNegativeResponse(response))
             {
                 Cache.Set(qname, NegativeCacheEntry.Instance, TimeSpan.FromSeconds(negativeTtl));
             }
 
+            return null;
+        }
+
+        if (response.Header.RCode != 0)
+        {
+            Logger.Warning("{Indent}└─ DNS error RCode={RCode} from {Server}", indent, response.Header.RCode, server);
             return null;
         }
 
@@ -561,9 +700,9 @@ public static class RecursiveResolver
             if (!hasNS)
             {
                 var negativeTtl = ExtractNegativeTTL(response.Authorities);
-                Logger.Information("{Indent}└─ NODATA: {QName} has no A records (TTL={TTL}s)", indent, qname,
+                Logger.Debug("{Indent}└─ NODATA: {QName} has no A records (TTL={TTL}s)", indent, qname,
                     negativeTtl);
-                if (negativeTtl > 0)
+                if (negativeTtl > 0 && CanTrustNegativeResponse(response))
                 {
                     Cache.Set(qname, NegativeCacheEntry.Instance, TimeSpan.FromSeconds(negativeTtl));
                 }
@@ -574,33 +713,71 @@ public static class RecursiveResolver
 
         foreach (var answer in response.Answers)
         {
-            if (answer.Type == 5 && answer.ParsedRData is string cnameTarget)
+            if (answer.Type == (ushort)DNSRecordType.A &&
+                answer.Class == 1 &&
+                string.Equals(answer.Name, qname, StringComparison.OrdinalIgnoreCase) &&
+                answer.ParsedRData is IPAddress ip)
             {
-                if (depth >= MaxCnameChainDepth)
+                Logger.Debug("{Indent}└─ Resolved: {QName} → {IP} (TTL={TTL}s)",
+                    indent, qname, ip, answer.TTL);
+                if (answer.TTL > 0)
+                    Cache.Set(qname, ip, TimeSpan.FromSeconds(answer.TTL));
+
+                return ip;
+            }
+        }
+
+        foreach (var answer in response.Answers)
+        {
+            if (answer.Type == (ushort)DNSRecordType.CNAME &&
+                string.Equals(answer.Name, qname, StringComparison.OrdinalIgnoreCase) &&
+                answer.ParsedRData is string cnameTarget)
+            {
+                if (cnameDepth >= MaxCnameChainDepth)
                 {
                     Logger.Warning("{Indent}└─ CNAME chain too deep for {QName}, aborting", indent, qname);
                     return null;
                 }
 
-                var cnameTargetLower = cnameTarget.ToLowerInvariant();
-                if (!visitedCnames.TryAdd(cnameTargetLower, 0))
+                var cnameTargetLower = NormalizeQueryName(cnameTarget);
+                visitedCnames.Add(qname);
+                if (!visitedCnames.Add(cnameTargetLower))
                 {
                     Logger.Warning("{Indent}└─ CNAME loop detected: {QName} → {Target} (already visited)", indent,
                         qname, cnameTarget);
                     return null;
                 }
 
-                visitedCnames.TryAdd(qname.ToLowerInvariant(), 0);
-                Logger.Information("{Indent}├─ CNAME: {QName} → {Target}", indent, qname, cnameTarget);
+                Logger.Debug("{Indent}├─ CNAME: {QName} → {Target}", indent, qname, cnameTarget);
 
-                var targetIp = await ResolveWithRootFallback(cnameTargetLower, ct, depth + 1, visitedCnames);
+                foreach (var targetAnswer in response.Answers)
+                {
+                    if (targetAnswer.Type != (ushort)DNSRecordType.A ||
+                        targetAnswer.Class != 1 ||
+                        !string.Equals(targetAnswer.Name, cnameTargetLower, StringComparison.OrdinalIgnoreCase) ||
+                        targetAnswer.ParsedRData is not IPAddress includedTargetIp)
+                    {
+                        continue;
+                    }
+
+                    var ttl = Math.Min(answer.TTL, targetAnswer.TTL);
+                    if (ttl > 0)
+                        Cache.Set(qname, includedTargetIp, TimeSpan.FromSeconds(ttl));
+
+                    Logger.Debug("{Indent}└─ Resolved from included CNAME answer: {QName} → {IP}",
+                        indent, qname, includedTargetIp);
+                    return includedTargetIp;
+                }
+
+                var targetIp = await ResolveWithRootFallback(
+                    cnameTargetLower,
+                    ct,
+                    depth + 1,
+                    cnameDepth + 1,
+                    visitedCnames);
                 if (targetIp != null)
                 {
-                    Logger.Information("{Indent}└─ Resolved via CNAME: {QName} → {IP}", indent, qname, targetIp);
-                    if (answer.TTL > 0)
-                    {
-                        Cache.Set(qname, targetIp, TimeSpan.FromSeconds(answer.TTL));
-                    }
+                    Logger.Debug("{Indent}└─ Resolved via CNAME: {QName} → {IP}", indent, qname, targetIp);
                 }
 
                 return targetIp;
@@ -609,82 +786,38 @@ public static class RecursiveResolver
 
         foreach (var answer in response.Answers)
         {
-            if (answer.ParsedRData is IPAddress ip)
+            if (answer.Type == (ushort)DNSRecordType.A && answer.Class == 1 &&
+                answer.ParsedRData is IPAddress)
             {
-                Logger.Information("{Indent}└─ Resolved: {QName} → {IP} (TTL={TTL}s)",
-                    indent, qname, ip, answer.TTL);
-                if (answer.TTL > 0)
-                {
-                    Cache.Set(qname, ip, TimeSpan.FromSeconds(answer.TTL));
-                }
-
-                return ip;
+                Logger.Warning("{Indent}│  Ignoring unrelated A answer for {AnswerName}", indent, answer.Name);
             }
         }
 
-        Dictionary<string, IPAddress> glueRecords = null;
-        foreach (var additional in response.Additionals)
+        var nameserverList = await GetNameserverAddresses(response, server, ct, depth, indent);
+        if (nameserverList.Count == 0)
         {
-            if (additional.Type == 1 && additional.ParsedRData is IPAddress glueIp)
-            {
-                glueRecords ??= new Dictionary<string, IPAddress>();
-                glueRecords[additional.Name] = glueIp;
-                Logger.Verbose("{Indent}│  Glue: {NSName} → {IP}", indent, additional.Name, glueIp);
-                if (additional.TTL > 0)
-                {
-                    Cache.Set(additional.Name, glueIp, TimeSpan.FromSeconds(additional.TTL));
-                }
-            }
-        }
-
-        var nameserverIps = new HashSet<IPAddress>();
-        var nameserversToResolve = new List<string>();
-
-        foreach (var authority in response.Authorities)
-        {
-            if (authority.Type == 2 && authority.ParsedRData is string nsHostname)
-            {
-                Logger.Information("{Indent}├─ Referral: {NSName}", indent, nsHostname);
-
-                if (glueRecords != null && glueRecords.TryGetValue(nsHostname, out var nsIp))
-                {
-                    Logger.Information("{Indent}│  Using glue record: {NSName} → {IP}", indent, nsHostname, nsIp);
-                    nameserverIps.Add(nsIp);
-                }
-                else
-                {
-                    nameserversToResolve.Add(nsHostname);
-                }
-            }
-        }
-
-        foreach (var nsHostname in nameserversToResolve)
-        {
-            Logger.Information("{Indent}│  Resolving nameserver: {NSName}", indent, nsHostname);
-            var resolvedNsIp = await ResolveWithRootFallback(nsHostname, ct, depth + 1);
-            if (resolvedNsIp != null)
-                nameserverIps.Add(resolvedNsIp);
-        }
-
-        if (nameserverIps.Count == 0)
-        {
-            Logger.Warning("{Indent}└─ No usable nameservers for {QName}", indent, qname);
+            Logger.Debug("{Indent}└─ No usable nameservers for {QName}", indent, qname);
             return null;
         }
 
-        var nameserverList = nameserverIps.ToList();
-
-        Logger.Information("{Indent}├─ Querying {Count} nameserver(s) in parallel", indent, nameserverList.Count);
+        Logger.Debug("{Indent}├─ Querying {Count} nameserver(s) in parallel", indent, nameserverList.Count);
         var result = await QueryNameserversInParallel(
             nameserverList,
-            (ns, token) => ResolveRecursive(qname, ns, token, depth + 1, visitedCnames),
+            (ns, token) => ResolveRecursive(
+                qname,
+                ns,
+                token,
+                depth + 1,
+                cnameDepth,
+                new HashSet<string>(visitedCnames, StringComparer.OrdinalIgnoreCase)),
+            static result => result is not null,
             ct
         );
 
         if (result != null)
             return result;
 
-        Logger.Warning("{Indent}└─ No usable response for {QName}", indent, qname);
+        Logger.Debug("{Indent}└─ No usable response for {QName}", indent, qname);
         return null;
     }
 
@@ -699,20 +832,16 @@ public static class RecursiveResolver
             return Array.Empty<DNSResourceRecord>();
         }
 
-        Logger.Information("{Indent}├─ Query: {QName} (type={QType}) @ {Server} (depth={Depth})",
+        Logger.Debug("{Indent}├─ Query: {QName} (type={QType}) @ {Server} (depth={Depth})",
             indent, qname, qtype, server, depth);
 
         if (!RateLimiter.AllowQuery(server.ToString()))
         {
-            Logger.Warning("{Indent}└─ Rate limit exceeded for {Server}, query rejected", indent, server);
+            Logger.Debug("{Indent}└─ Rate limit exceeded for {Server}, query rejected", indent, server);
             return Array.Empty<DNSResourceRecord>();
         }
 
-        var query = new DNSQuery
-        {
-            Header = new DNSHeader(),
-            Question = new DNSQuestion { QName = qname, QType = qtype }
-        };
+        var query = CreateQuery(qname, qtype);
 
         var response = await SendDnsQuery(query, server, ct);
 
@@ -739,107 +868,128 @@ public static class RecursiveResolver
         if (response.Header.RCode == 3)
         {
             var negativeTtl = ExtractNegativeTTL(response.Authorities);
-            Logger.Information("{Indent}└─ NXDOMAIN: {QName} does not exist (TTL={TTL}s)", indent, qname, negativeTtl);
+            Logger.Debug("{Indent}└─ NXDOMAIN: {QName} does not exist (TTL={TTL}s)", indent, qname, negativeTtl);
             return Array.Empty<DNSResourceRecord>();
+        }
+
+        if (response.Header.RCode != 0)
+        {
+            Logger.Warning("{Indent}└─ DNS error RCode={RCode} from {Server}", indent, response.Header.RCode, server);
+            return [];
         }
 
         if (response.Answers.Length > 0)
         {
-            Logger.Information("{Indent}└─ Found {Count} answer(s) for {QName}", indent, response.Answers.Length,
+            Logger.Debug("{Indent}└─ Found {Count} answer(s) for {QName}", indent, response.Answers.Length,
                 qname);
             return response.Answers;
         }
 
-        Dictionary<string, IPAddress> glueRecords = null;
-        foreach (var additional in response.Additionals)
+        var nameserverList = await GetNameserverAddresses(response, server, ct, depth, indent);
+        if (nameserverList.Count == 0)
         {
-            if (additional.Type == 1 && additional.ParsedRData is IPAddress glueIp)
-            {
-                glueRecords ??= new Dictionary<string, IPAddress>();
-                glueRecords[additional.Name] = glueIp;
-                Logger.Verbose("{Indent}│  Glue: {NSName} → {IP}", indent, additional.Name, glueIp);
-            }
-        }
-
-        var nameserverIps = new HashSet<IPAddress>();
-        var nameserversToResolve = new List<string>();
-
-        foreach (var authority in response.Authorities)
-        {
-            if (authority.Type == 2 && authority.ParsedRData is string nsHostname)
-            {
-                Logger.Information("{Indent}├─ Referral: {NSName}", indent, nsHostname);
-
-                if (glueRecords != null && glueRecords.TryGetValue(nsHostname, out var nsIp))
-                {
-                    Logger.Information("{Indent}│  Using glue record: {NSName} → {IP}", indent, nsHostname, nsIp);
-                    nameserverIps.Add(nsIp);
-                }
-                else
-                {
-                    nameserversToResolve.Add(nsHostname);
-                }
-            }
-        }
-
-        foreach (var nsHostname in nameserversToResolve)
-        {
-            Logger.Information("{Indent}│  Resolving nameserver: {NSName}", indent, nsHostname);
-            var resolvedNsIp = await ResolveWithRootFallback(nsHostname, ct, depth + 1);
-            if (resolvedNsIp != null)
-                nameserverIps.Add(resolvedNsIp);
-        }
-
-        if (nameserverIps.Count == 0)
-        {
-            Logger.Warning("{Indent}└─ No usable nameservers for {QName}", indent, qname);
+            Logger.Debug("{Indent}└─ No usable nameservers for {QName}", indent, qname);
             return Array.Empty<DNSResourceRecord>();
         }
 
-        var nameserverList = nameserverIps.ToList();
-
-        Logger.Information("{Indent}├─ Querying {Count} nameserver(s) in parallel", indent, nameserverList.Count);
+        Logger.Debug("{Indent}├─ Querying {Count} nameserver(s) in parallel", indent, nameserverList.Count);
         var result = await QueryNameserversInParallel(
             nameserverList,
-            (ns, token) => QueryRecursive(qname, qtype, ns, token, depth + 1),
+            async (ns, token) => await QueryRecursive(qname, qtype, ns, token, depth + 1),
+            static records => records is { Length: > 0 },
             ct
         );
 
         if (result != null && result.Length > 0)
             return result;
 
-        Logger.Warning("{Indent}└─ No usable response for {QName}", indent, qname);
+        Logger.Debug("{Indent}└─ No usable response for {QName}", indent, qname);
         return Array.Empty<DNSResourceRecord>();
     }
 
-    private static async ValueTask<T> QueryNameserversInParallel<T>(
+    private static async ValueTask<List<IPAddress>> GetNameserverAddresses(
+        DNSResponse response,
+        IPAddress sourceServer,
+        CancellationToken ct,
+        int depth,
+        string indent)
+    {
+        Dictionary<string, IPAddress>? glueRecords = null;
+        foreach (var additional in response.Additionals)
+        {
+            if (additional.Type != (ushort)DNSRecordType.A ||
+                additional.Class != 1 ||
+                additional.ParsedRData is not IPAddress glueIp)
+            {
+                continue;
+            }
+
+            glueRecords ??= new Dictionary<string, IPAddress>(StringComparer.OrdinalIgnoreCase);
+            glueRecords[additional.Name] = glueIp;
+            Logger.Verbose("{Indent}│  Glue: {NSName} → {IP}", indent, additional.Name, glueIp);
+        }
+
+        var nameserverIps = new HashSet<IPAddress>();
+        var nameserversToResolve = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var authority in response.Authorities)
+        {
+            if (authority.Type != (ushort)DNSRecordType.NS ||
+                authority.Class != 1 ||
+                authority.ParsedRData is not string nsHostname)
+            {
+                continue;
+            }
+
+            Logger.Debug("{Indent}├─ Referral: {NSName}", indent, nsHostname);
+            var canUseGlue = IsRootServer(sourceServer) || IsSubdomainOrEqual(nsHostname, authority.Name);
+            if (canUseGlue && glueRecords?.TryGetValue(nsHostname, out var nsIp) == true)
+            {
+                Logger.Debug("{Indent}│  Using glue record: {NSName} → {IP}", indent, nsHostname, nsIp);
+                nameserverIps.Add(nsIp);
+            }
+            else
+            {
+                nameserversToResolve.Add(nsHostname);
+            }
+        }
+
+        foreach (var nsHostname in nameserversToResolve)
+        {
+            if (nameserverIps.Count >= MaxParallelNameservers)
+                break;
+
+            Logger.Debug("{Indent}│  Resolving nameserver: {NSName}", indent, nsHostname);
+            var resolvedNsIp = await ResolveWithRootFallback(nsHostname, ct, depth + 1);
+            if (resolvedNsIp is not null)
+                nameserverIps.Add(resolvedNsIp);
+        }
+
+        return nameserverIps.ToList();
+    }
+
+    internal static async ValueTask<T?> QueryNameserversInParallel<T>(
         List<IPAddress> nameservers,
-        Func<IPAddress, CancellationToken, ValueTask<T>> queryFunc,
+        Func<IPAddress, CancellationToken, ValueTask<T?>> queryFunc,
+        Func<T?, bool> isSuccessful,
         CancellationToken ct
     ) where T : class
     {
-        if (nameservers.Count == 1)
+        var candidates = nameservers.Count <= MaxParallelNameservers
+            ? nameservers
+            : nameservers.GetRange(0, MaxParallelNameservers);
+
+        if (candidates.Count == 1)
         {
-            return await queryFunc(nameservers[0], ct);
+            var result = await queryFunc(candidates[0], ct);
+            return isSuccessful(result) ? result : null;
         }
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var tasks = new List<Task<T>>(nameservers.Count);
-        foreach (var ns in nameservers)
+        var tasks = new List<Task<T?>>(candidates.Count);
+        foreach (var ns in candidates)
         {
-            var capturedNs = ns;
-            tasks.Add(Task.Run(async () =>
-            {
-                try
-                {
-                    return await queryFunc(capturedNs, cts.Token);
-                }
-                catch (Exception ex) when (ex is SocketException or TimeoutException or OperationCanceledException
-                                               or IOException or InvalidDataException)
-                {
-                    return null;
-                }
-            }, cts.Token));
+            tasks.Add(ExecuteQuery(ns));
         }
 
         while (tasks.Count > 0)
@@ -847,7 +997,7 @@ public static class RecursiveResolver
             var completedTask = await Task.WhenAny(tasks);
             var result = await completedTask;
 
-            if (result != null)
+            if (isSuccessful(result))
             {
                 await cts.CancelAsync();
                 return result;
@@ -857,27 +1007,54 @@ public static class RecursiveResolver
         }
 
         return null;
+
+        async Task<T?> ExecuteQuery(IPAddress nameserver)
+        {
+            try
+            {
+                return await queryFunc(nameserver, cts.Token);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsTransientNetworkFailure(ex))
+            {
+                return null;
+            }
+        }
     }
 
-    private static uint ExtractNegativeTTL(DNSResourceRecord[] authorities)
+    internal static uint ExtractNegativeTTL(DNSResourceRecord[] authorities)
     {
         foreach (var auth in authorities)
         {
             if (auth.Type == 6 && auth.ParsedRData is SOARecord soa)
             {
-                return soa.Minimum;
+                return Math.Min(auth.TTL, soa.Minimum);
             }
         }
 
-        return DefaultNegativeCacheTTL;
+        return 0;
     }
 
     private static bool ValidateResponse(DNSQuery query, DNSResponse response, IPAddress server, string indent)
     {
+        if (response.Header.Questions != 1)
+        {
+            Logger.Warning("{Indent}└─ Invalid question count from {Server}: {Count} (expected 1)",
+                indent, server, response.Header.Questions);
+            return false;
+        }
+
         if (response.Header.QR != 1)
         {
             Logger.Warning("{Indent}└─ Invalid response from {Server}: QR bit not set (not a response)",
                 indent, server);
+            return false;
+        }
+
+        if (response.Header.Opcode != query.Header.Opcode)
+        {
+            Logger.Warning(
+                "{Indent}└─ Response opcode mismatch from {Server}: expected {Expected}, got {Actual}",
+                indent, server, query.Header.Opcode, response.Header.Opcode);
             return false;
         }
 
@@ -905,13 +1082,77 @@ public static class RecursiveResolver
             return false;
         }
 
-        if (response.Header.Questions != 1)
+        if (response.Question.QClass != query.Question.QClass)
         {
-            Logger.Warning("{Indent}└─ Invalid question count from {Server}: {Count} (expected 1)",
-                indent, server, response.Header.Questions);
+            Logger.Warning(
+                "{Indent}└─ Question class mismatch from {Server}: expected {Expected}, got {Actual}",
+                indent, server, query.Question.QClass, response.Question.QClass);
             return false;
         }
 
         return true;
+    }
+
+    private static DNSQuery CreateQuery(string qname, ushort qtype)
+    {
+        var recursionDesired = ForwardingDnsServer is not null || UseDnsOverHttps || UseDnsOverTls;
+        return new DNSQuery
+        {
+            Header = new DNSHeader { RD = recursionDesired ? (byte)1 : (byte)0 },
+            Question = new DNSQuestion { QName = qname, QType = qtype }
+        };
+    }
+
+    internal static string NormalizeQueryName(string qname)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(qname);
+
+        if (!string.Equals(qname, qname.Trim(), StringComparison.Ordinal))
+            throw new ArgumentException("DNS names cannot contain leading or trailing whitespace.", nameof(qname));
+
+        var nameWithoutRootDot = qname.EndsWith('.') ? qname[..^1] : qname;
+        if (nameWithoutRootDot.Length == 0)
+            return string.Empty;
+
+        try
+        {
+            return new IdnMapping().GetAscii(nameWithoutRootDot).ToLowerInvariant();
+        }
+        catch (ArgumentException ex)
+        {
+            throw new ArgumentException($"'{qname}' is not a valid DNS name.", nameof(qname), ex);
+        }
+    }
+
+    private static bool IsTransientNetworkFailure(Exception exception)
+    {
+        return exception is SocketException
+            or TimeoutException
+            or OperationCanceledException
+            or IOException
+            or InvalidDataException
+            or HttpRequestException;
+    }
+
+    private static bool CanTrustNegativeResponse(DNSResponse response)
+    {
+        return response.Header.AA == 1 ||
+               ForwardingDnsServer is not null ||
+               UseDnsOverHttps ||
+               UseDnsOverTls;
+    }
+
+    private static bool IsSubdomainOrEqual(string name, string zone)
+    {
+        if (zone.Length == 0)
+            return true;
+
+        return string.Equals(name, zone, StringComparison.OrdinalIgnoreCase) ||
+               name.EndsWith($".{zone}", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsRootServer(IPAddress server)
+    {
+        return Array.IndexOf(RootServers, server) >= 0;
     }
 }

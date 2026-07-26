@@ -4,6 +4,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "tiny-dns", "tiny-dns\tiny-d
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "tiny-sandbox", "tiny-sandbox\tiny-sandbox.csproj", "{E4922D46-685D-45C6-93C2-3133CDDB24A1}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "tiny-dns.Tests", "tiny-dns.Tests\tiny-dns.Tests.csproj", "{C32D122C-9907-43AB-887E-5D7336EB9EA7}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -18,5 +20,9 @@ Global
 		{E4922D46-685D-45C6-93C2-3133CDDB24A1}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{E4922D46-685D-45C6-93C2-3133CDDB24A1}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{E4922D46-685D-45C6-93C2-3133CDDB24A1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C32D122C-9907-43AB-887E-5D7336EB9EA7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C32D122C-9907-43AB-887E-5D7336EB9EA7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C32D122C-9907-43AB-887E-5D7336EB9EA7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C32D122C-9907-43AB-887E-5D7336EB9EA7}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

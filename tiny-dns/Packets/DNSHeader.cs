@@ -1,10 +1,11 @@
+using System.Security.Cryptography;
 using TinyDNS.Serialization;
 
 namespace TinyDNS.Packets;
 
 public record DNSHeader : ISerializable, IDeserializable<DNSHeader>
 {
-    public ushort Id { get; set; } = (ushort)Random.Shared.Next(ushort.MinValue, ushort.MaxValue + 1);
+    public ushort Id { get; set; } = (ushort)RandomNumberGenerator.GetInt32(ushort.MaxValue + 1);
     public byte QR { get; set; }
     public byte Opcode { get; set; }
     public byte AA { get; set; }
