@@ -4,7 +4,7 @@ namespace TinyDNS.Packets;
 
 public record DNSQuestion : ISerializable, IDeserializable<DNSQuestion>
 {
-    public string QName { get; set; }
+    public string QName { get; set; } = string.Empty;
     public ushort QType { get; set; } = 1;
     public ushort QClass { get; set; } = 1;
 

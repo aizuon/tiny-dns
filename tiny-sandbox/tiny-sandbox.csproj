@@ -5,7 +5,8 @@
         <TargetFramework>net10.0</TargetFramework>
         <RootNamespace>TinySandbox</RootNamespace>
         <ImplicitUsings>enable</ImplicitUsings>
-        <Nullable>disable</Nullable>
+        <Nullable>enable</Nullable>
+        <AnalysisLevel>latest</AnalysisLevel>
     </PropertyGroup>
 
     <ItemGroup>

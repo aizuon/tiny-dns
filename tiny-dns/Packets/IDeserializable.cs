@@ -4,5 +4,5 @@ namespace TinyDNS.Packets;
 
 public interface IDeserializable<out T>
 {
-    public static abstract T Deserialize(BinaryBuffer buffer);
+    static abstract T Deserialize(BinaryBuffer buffer);
 }

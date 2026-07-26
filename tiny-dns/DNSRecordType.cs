@@ -8,5 +8,6 @@ public enum DNSRecordType : ushort
     SOA = 6,
     PTR = 12,
     MX = 15,
-    TXT = 16
+    TXT = 16,
+    AAAA = 28
 }
